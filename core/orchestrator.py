@@ -7,7 +7,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import interrupt, Command
 from langgraph.checkpoint.memory import InMemorySaver
 from dotenv import load_dotenv
-from guards import guard, path_readings
+from guards import check_paths, path_readings
 
 
 load_dotenv()
@@ -87,19 +87,15 @@ def user_intent(state:OrchestratorState):
         return unclassified(f"could not classify '{request[:100]}'")
     return {"steps":steps,"current":0,"results":[]}
 
-# ponytail: placeholder workflows return fake outputs to test routing; replace each with its real agent,
-# which calls guard(action, exact_path) right before its own destructive tool call.
-# Until then every step that could act on the machine is confirmed: the placeholder can't tell a read from a write.
+# ponytail: placeholder workflows return fake outputs to test routing; replace each with its real agent.
+# Real workflows call guard(action, exact_path) inside their destructive tools only (delete, move, send,
+# pay, change settings); safe tools (open, search, read, screenshot) just run. Placeholders do nothing
+# real, so they never ask: the Files placeholder only refuses paths outside the allowed folders.
 def make_workflow(name):
     def workflow(s):
         step = s["steps"][s["current"]]
-        task, paths = step["task"], path_readings(step["task"])
-        if name == "Internal_Workflow":
-            blocked = None  # no side effects
-        elif name == "Files_Workflow" and not paths:
-            blocked = "refused: no explicit file path to check"  # e.g. "delete the Windows folder"
-        else:
-            blocked = guard(task, *paths)  # allowlist every reading of every path, then ask the user
+        task = step["task"]
+        blocked = check_paths(*path_readings(task)) if name == "Files_Workflow" else None
         if blocked:  # stop the whole plan: later steps may depend on this one
             out = {"workflow":name,"task":task,"output":blocked}
             return {"results":s["results"] + [out],"current":len(s["steps"])}

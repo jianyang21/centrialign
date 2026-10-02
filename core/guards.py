@@ -27,12 +27,18 @@ def is_allowed(path) -> bool:
     return p is not None and any(root in p.parents for root in ALLOWED_ROOTS)  # strictly inside a root
 
 
-def guard(action: str, *paths) -> str | None:
-    """None = allowed and confirmed by the user. Otherwise the reason the action was blocked.
-    Must run inside a graph node: it pauses the graph with interrupt() to ask the user."""
+def check_paths(*paths) -> str | None:
+    """Code-only check, never asks. None = every path is inside the allowed folders."""
     bad = [str(p) for p in paths if not is_allowed(p)]
-    if bad:
-        return f"refused: outside allowed folders: {', '.join(bad)}"
+    return f"refused: outside allowed folders: {', '.join(bad)}" if bad else None
+
+
+def guard(action: str, *paths) -> str | None:
+    """For destructive tools only (delete, move, send, pay, change settings): path check, then ask.
+    None = allowed and confirmed by the user. Otherwise the reason the action was blocked.
+    Must run inside a graph node: it pauses the graph with interrupt() to ask the user."""
+    if (blocked := check_paths(*paths)):
+        return blocked
     targets = ", ".join(str(resolve(p)) for p in paths) or "none detected (not checked by code)"
     answer = interrupt(f"About to: {action}\nTargets: {targets}\nProceed? (yes/no)")
     if str(answer).strip().lower() not in ("y", "yes"):
