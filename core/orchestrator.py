@@ -1,0 +1,130 @@
+from langgraph.graph import StateGraph,START,END
+from pydantic import BaseModel,Field
+from typing import Literal
+from typing_extensions import TypedDict
+from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage
+from langgraph.types import interrupt, Command
+from langgraph.checkpoint.memory import InMemorySaver
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+WorkFlowRoute = Literal["Browser_Workflow","Files_Workflow","Desktop_Workflow","Internal_Workflow","Unclassified"]
+WORKFLOWS = ["Browser_Workflow","Files_Workflow","Desktop_Workflow","Internal_Workflow"]
+MAX_REQUEST_CHARS = 2000
+
+
+class Step(TypedDict):
+    workflow:WorkFlowRoute
+    task:str
+
+class OrchestratorState(TypedDict):
+    user_request:str
+    steps: list[Step]
+    current:int
+    results: list[dict]
+
+class IntentClassifier(BaseModel):
+    steps: list[Step] = Field(description="Steps in the order they must happen. Usually just one.")
+
+def clarify(state):
+    reason = next(st["task"] for st in state["steps"] if st["workflow"] == "Unclassified")
+    answer = interrupt(f"I can't handle that ({reason}). Can you rephrase it?")
+    return {"user_request":answer}
+
+def next_step(s):
+    if any(st["workflow"] == "Unclassified" for st in s["steps"]):
+        return "clarify"
+    if s["current"] >= len(s["steps"]):
+        return END
+    return s["steps"][s["current"]]["workflow"]
+
+def unclassified(reason):
+    return {"steps":[{"workflow":"Unclassified","task":reason}],"current":0,"results":[]}
+
+def user_intent(state:OrchestratorState):
+    request = str(state["user_request"]).strip()
+    if not request:
+        return unclassified("the request is empty")
+    if len(request) > MAX_REQUEST_CHARS:
+        return unclassified(f"the request is {len(request)} characters, max is {MAX_REQUEST_CHARS}")
+
+    llm = ChatGroq(model= "openai/gpt-oss-20b",temperature=0)
+
+    structured_llm = llm.with_structured_output(IntentClassifier, method="json_mode")
+
+    prompt = f"""
+              Split the user request into ordered steps and assign each step to exactly one workflow:
+              - Browser_Workflow: opening websites, searching the web, using web apps (Gmail, YouTube, Google, etc.).
+              - Files_Workflow: creating, reading, moving, renaming, deleting or searching files and folders.
+              - Desktop_Workflow: controlling the OS or desktop apps (open/close apps, settings, volume, screenshots, windows).
+              - Internal_Workflow: ONLY general knowledge questions or conversation that need no action on the computer or web.
+              - Unclassified : If the request is vague,unclear and doesn't fit any workflow above. Do NOT guess;choose this instead
+
+              Rules:
+              - Email, messaging, shopping or booking -> Browser_Workflow (we use web apps, not desktop email clients).
+              - If the request needs several workflows, return one step per workflow in the order they must happen.
+              - If any part is unclear, return a single Unclassified step.
+
+              Examples:
+              "reply to my manager's email" -> {{"steps": [{{"workflow": "Browser_Workflow", "task": "reply to manager's email"}}]}}
+              "take a screenshot and email it to John" -> {{"steps": [{{"workflow": "Desktop_Workflow", "task": "take a screenshot"}}, {{"workflow": "Browser_Workflow", "task": "email the screenshot to John"}}]}}
+              "hi" -> {{"steps": [{{"workflow": "Internal_Workflow", "task": "greet the user"}}]}}
+              "do the thing" -> {{"steps": [{{"workflow": "Unclassified", "task": "do the thing"}}]}}
+
+              Respond ONLY with JSON in exactly the format shown in the examples.
+              Request: "{state['user_request']}"
+          """
+    try:
+        classification = structured_llm.invoke([HumanMessage(content = prompt)])
+        steps = classification.steps
+    except Exception as e:
+        print(f"classifier error: {type(e).__name__}: {str(e)[:300]}")
+        return unclassified(f"could not classify '{request[:100]}'")
+    return {"steps":steps,"current":0,"results":[]}
+
+# ponytail: placeholder workflows return fake outputs to test routing; replace each with its real agent
+def make_workflow(name):
+    def workflow(s):
+        step = s["steps"][s["current"]]
+        out = {"workflow":name,"task":step["task"],"output":f"fake result of '{step['task']}'"}
+        return {"results":s["results"] + [out],"current":s["current"] + 1}
+    return workflow
+
+graph = StateGraph(OrchestratorState)
+graph.add_node("user_intent",user_intent)
+graph.add_node('clarify',clarify)
+for wf in WORKFLOWS:
+    graph.add_node(wf,make_workflow(wf))
+    graph.add_conditional_edges(wf,next_step,["clarify",END] + WORKFLOWS)
+
+graph.add_edge(START,"user_intent")
+graph.add_conditional_edges('user_intent',next_step,["clarify",END] + WORKFLOWS)
+graph.add_edge("clarify",'user_intent')
+
+
+app = graph.compile(checkpointer=InMemorySaver())
+
+if __name__ == '__main__':
+    requests = [
+        "Hey I want to go google and open gmail",
+        "I need to reply to that email from my manager",
+        "where did I put my resume pdf",
+        "my screen is too bright",
+        "do the thing",
+        "take a screenshot and email it to John",
+        "hi",
+    ]
+    for i, request in enumerate(requests):
+        config = {"configurable": {"thread_id": str(i)}}
+        result = app.invoke({"user_request": request}, config)
+
+        while "__interrupt__" in result:
+            question = result["__interrupt__"][0].value
+            result = app.invoke(Command(resume=input(f"{question}\nYou: ")), config)
+
+        print(f"\n{request}")
+        for r in result["results"]:
+            print(f"  {r['workflow']}: {r['task']}")
