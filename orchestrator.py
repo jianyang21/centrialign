@@ -7,11 +7,10 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import interrupt, Command
 from langgraph.checkpoint.memory import InMemorySaver
 from dotenv import load_dotenv
+load_dotenv()  # before the workflow imports: they read their settings (BROWSER_MODEL, CHROME_PATH) at import
 from guards import check_paths, path_readings
 from workflows import browser_workflow
 
-
-load_dotenv()
 
 WorkFlowRoute = Literal["Browser_Workflow","Files_Workflow","Desktop_Workflow","Internal_Workflow","Unclassified"]
 WORKFLOWS = ["Browser_Workflow","Files_Workflow","Desktop_Workflow","Internal_Workflow"]
@@ -127,17 +126,35 @@ app = graph.compile(checkpointer=InMemorySaver())
 
 if __name__ == '__main__':
     import sys
+    # Browser scenarios, safest first. Type "cancel" at any question to skip to the next one.
     requests = sys.argv[1:] or [
-        "Search for the latest client email and draft a reply"
+        # read only: navigate and answer, never asks
+        "Go to wikipedia and tell me who is the highest goal scorer for the Germany national football team",
+        # typing + clicking on a site, never asks
+        "Search YouTube for a Playwright Python tutorial and open the first video",
+        # login hand-off: asks you to log in yourself, then continues
+        "Go to instagram and wait for me to log in",
+        # new email: shows you the draft before Send (yes / no / what to change)
+        "Send an email from my Gmail to dshakthi2003@gmail.com saying the shipment is delayed to Friday",
+        # reply: finds the email, reads it, drafts a reply, asks before Send
+        "Search for the latest email from sddeva@gmail.com and draft a reply",
     ]
     for i, request in enumerate(requests):
         config = {"configurable": {"thread_id": str(i)}}
         result = app.invoke({"user_request": request}, config)
 
+        cancelled = False
         while "__interrupt__" in result:
             question = result["__interrupt__"][0].value
-            result = app.invoke(Command(resume=input(f"{question}\nYou: ")), config)
+            answer = input(f"{question}\nYou: ")
+            if answer.strip(" .!").lower().split()[:1] in (["cancel"], ["exit"], ["quit"], ["abort"]):
+                cancelled = True  # never resumed, so nothing after this question runs
+                break
+            result = app.invoke(Command(resume=answer), config)
 
+        if cancelled:
+            print(f"\nCancelled: {request}")
+            continue
         print(f"\n{request}")
         for r in result["results"]:
             print(f"  {r['workflow']}: {r['task']} -> {r['output']}")
