@@ -26,6 +26,9 @@ MAX_ACTIONS = 25
 RECURSION_LIMIT = 2 * MAX_ACTIONS + 5  # decide + act per action; LangGraph's default of 25 is too low
 MAX_PAGE_CHARS = 15_000  # ponytail: plain cut, long pages lose their bottom; smarter trimming if it bites
 # Safety net under the LLM's own irreversible flag: text on a page can talk the LLM out of setting it.
+# Invisible formatting characters some sites put in labels (Gmail: "Send ‪(Ctrl-Enter)‬"): hidden from
+# the LLM, and allowed between characters when matching a name it gives back.
+INVISIBLE = re.compile("[​-‏‪-‮⁠-⁩﻿]")
 RISKY = re.compile(r"\b(send|pay|buy|purchase|order|checkout|delete|remove|submit|confirm|post|publish|transfer)\b", re.I)
 
 SYSTEM_PROMPT = """
@@ -50,6 +53,8 @@ Pick exactly ONE next action:
 Set irreversible to true for any action that sends, posts, buys, pays, deletes, submits or confirms something,
 and set summary to one line saying what will happen, e.g. "Send reply to Jane <jane@acme.com> about the March invoice".
 Fill in everything before sending or submitting: the user sees what you typed and approves it.
+An email needs a recipient, a subject and a body; fill all three before clicking Send.
+If a result says a browser popup was dismissed, fix what it complained about instead of repeating the action.
 When writing a message, write the complete text from the task. Never write placeholders like [Your Name]:
 if you don't know a detail such as the sender's name, leave it out (end with just "Best regards,").
 If the user declines with feedback, change what you typed to match it and try again. If they just decline, use fail.
@@ -77,7 +82,7 @@ class BrowserState(TypedDict):
     action: dict
     output: str
     failed: bool  # the orchestrator stops the plan when a workflow fails
-    typed: dict  # field name -> text typed since the last confirmed action; shown when asking to confirm
+    typed: dict  # field name -> text typed (and files attached) in this task; shown when asking to confirm
 
 
 # ponytail: one browser per process. If the user closes the window, the browser stays broken until
@@ -115,9 +120,11 @@ def open_chrome(pw):
 def page_tree(page):
     """Open dialogs first, then the page. A body snapshot can leave dialogs out (Gmail's compose window),
     and a popup is what the user is looking at, so it must survive the length cut."""
-    dialogs = page.get_by_role("dialog")
-    parts = [dialogs.nth(i).aria_snapshot() for i in range(dialogs.count())]
-    return "\n".join(parts + [page.locator("body").aria_snapshot()])[:MAX_PAGE_CHARS]
+    parts = []
+    for role in ("alertdialog", "dialog"):
+        dialogs = page.get_by_role(role)
+        parts += [dialogs.nth(i).aria_snapshot() for i in range(dialogs.count())]
+    return INVISIBLE.sub("", "\n".join(parts + [page.locator("body").aria_snapshot()]))[:MAX_PAGE_CHARS]
 
 
 def decide(s):
@@ -142,7 +149,7 @@ def decide(s):
 
 def act(s):
     a, page = s["action"], current_page()
-    tool, name, text = a["tool"], a["name"] or "", a["text"] or ""
+    tool, name, text = a["tool"], INVISIBLE.sub("", a["name"] or ""), a["text"] or ""
     what = f"{tool} {name or a['url'] or text!r}" + (f" <- {a['path']}" if tool == "upload" else "")
     if tool == "ask_human":
         question = text or name  # the LLM sometimes puts the question in name
@@ -155,15 +162,13 @@ def act(s):
             return log(s, f"{what} -> {blocked}")
         if not os.path.isfile(resolve(a["path"])):
             return log(s, f"{what} -> error: no such file {a['path']!r}")
-    confirmed = False
     if a["irreversible"] or (tool == "click" and RISKY.search(name)):
         # what was typed comes from code, not the LLM's word: a page can't make it hide what is sent
         typed = "\n".join(f"  {k}: {v}" for k, v in s.get("typed", {}).items()) or "  (nothing)"
         if (blocked := guard(f"{what} on {page.url}\nAgent says: {a['summary'] or '(no summary)'}\n"
                              f"Typed by the agent:\n{typed}\n"
                              f"(You can also edit it in the browser window, then type yes.)")):
-            return log(s, f"{what} -> {blocked}")  # draft kept, so the retry shows all of it
-        confirmed = True
+            return log(s, f"{what} -> {blocked}")
     try:
         result = run_action(page, tool, a["role"] or "", name, a["url"] or "", text, a["path"] or "")
     except PlaywrightError as e:
@@ -173,12 +178,27 @@ def act(s):
         out["typed"] = {**s.get("typed", {}), name: text}
     elif tool == "upload" and result.startswith("ok"):
         out["typed"] = {**s.get("typed", {}), f"Attached {os.path.basename(a['path'])}": str(resolve(a["path"]))}
-    elif confirmed:
-        out["typed"] = {}
-    return out
+    return out  # typed is kept for the whole task: a Send that didn't go through must still show the full draft
 
 
 def run_action(page, tool, role, name, url, text, path):
+    # Native popups (alert/confirm, e.g. Gmail's "Send without a subject?") aren't in the page tree, and
+    # Playwright silently answers them Cancel. Still answer Cancel (the safe choice), but tell the LLM.
+    popups = []
+    def dismiss(dialog):
+        popups.append(dialog.message)
+        dialog.dismiss()
+    page.on("dialog", dismiss)
+    try:
+        result = do_action(page, tool, role, name, url, text, path)
+    finally:
+        page.remove_listener("dialog", dismiss)
+    if popups:
+        result += f"; but a browser popup appeared and was dismissed (Cancel): {' / '.join(popups)!r}"
+    return result
+
+
+def do_action(page, tool, role, name, url, text, path):
     if tool == "goto":
         if urlparse(url).scheme not in ("http", "https"):
             return "refused: only http(s) urls"  # file:// would read local files around the Files allowlist
@@ -186,7 +206,9 @@ def run_action(page, tool, role, name, url, text, path):
     elif tool == "press":
         page.keyboard.press(text)
     else:
-        el = (page.get_by_text(name, exact=True) if role == "text" else page.get_by_role(role, name=name)).first
+        pattern = f"{INVISIBLE.pattern}*".join(map(re.escape, name))  # the page's name may hold invisible chars
+        el = (page.get_by_text(re.compile(rf"^\s*{pattern}\s*$", re.I)) if role == "text"
+              else page.get_by_role(role, name=re.compile(pattern, re.I))).first
         if tool == "type" and el.get_attribute("type", timeout=5000) == "password":
             return "refused: passwords are typed by the user, ask them to log in"  # keeps them out of the LLM
         if tool == "upload":  # catch the file picker the button opens and hand it the file: no OS dialog
@@ -198,6 +220,7 @@ def run_action(page, tool, role, name, url, text, path):
         else:
             el.fill(text, timeout=5000)
     page.wait_for_load_state()
+    page.wait_for_timeout(300)  # a popup the action triggers can open just after it returns
     return f"ok, now at {page.url}"
 
 

@@ -75,7 +75,9 @@ def test_all():
         pool.close()
 
         o.app, pool = fresh_app()  # "restart"
-        o.resume_all()
+        # resume only this test's task, exactly as --resume does; never resume_all(): that would pick up
+        # the user's own unfinished tasks and finish them with this test's fakes
+        print(o.drive(tid, None))
         row = db.execute("SELECT status, results FROM tasks WHERE thread_id = %s", tid)[0]
         assert row["status"] == "done", row
         assert [r["output"] for r in row["results"]] == ["did take a screenshot", "did email it to John"], row

@@ -145,6 +145,25 @@ def test_all():
     finally:
         os.remove(f.name)
 
+    # Gmail-style Send: a label with invisible characters still matches, and a native "send without a
+    # subject?" popup is answered Cancel AND reported, so the LLM fixes the draft instead of clicking again
+    bw.current_page().set_content("""<label>Subject <input id=s></label>
+        <button onclick="if (!document.getElementById('s').value && !confirm('Send this message without a subject?')) return;
+                         document.title='sent'">Send ‪(Ctrl-Enter)‬</button>
+        <div role=alertdialog aria-label="Heads up">Attachment still uploading</div>""")
+    assert "Send (Ctrl-Enter)" in bw.page_tree(page()) and "‪" not in bw.page_tree(page())
+    assert 'alertdialog "Heads up"' in bw.page_tree(page())
+    script(dict(send, name="Send (Ctrl-Enter)"), done)
+    r = app.invoke({"task": "send"}, {"configurable": {"thread_id": "popup"}})
+    r = app.invoke(Command(resume="yes"), {"configurable": {"thread_id": "popup"}})
+    assert "browser popup appeared and was dismissed (Cancel): 'Send this message without a subject?'" in r["history"][0], r
+    assert page().title() != "sent"
+
+    # the draft preview keeps what was typed after a confirmed Send, in case that Send didn't go through
+    script({"tool": "type", "role": "textbox", "name": "To", "text": "jane@acme.com"}, send, send, done)
+    r = run("send twice", "yes")
+    assert "To: jane@acme.com" in r["__interrupt__"][0].value, r["__interrupt__"][0].value
+
     # a misnamed field is shown back to the LLM, which retries
     script({"tool": "goto", "link": "https://example.com"}, done)
     r = run("open example")
