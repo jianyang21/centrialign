@@ -8,7 +8,7 @@ from langgraph.types import interrupt, Command
 from langgraph.checkpoint.memory import InMemorySaver
 from dotenv import load_dotenv
 load_dotenv()  # before the workflow imports: they read their settings (BROWSER_MODEL, CHROME_PATH) at import
-from workflows import browser_workflow, files_workflow
+from workflows import browser_workflow, desktop_workflow, files_workflow
 
 
 WorkFlowRoute = Literal["Browser_Workflow","Files_Workflow","Desktop_Workflow","Internal_Workflow","Unclassified"]
@@ -97,7 +97,7 @@ def make_workflow(name):
     return workflow
 
 # Built workflows: each has run(task) -> {"output", "failed"}.
-REAL = {"Browser_Workflow": browser_workflow, "Files_Workflow": files_workflow}
+REAL = {"Browser_Workflow": browser_workflow, "Files_Workflow": files_workflow, "Desktop_Workflow": desktop_workflow}
 
 def run_workflow(name):
     def node(s):
@@ -126,6 +126,12 @@ if __name__ == '__main__':
     import sys
     # Scenarios, safest first. Type "cancel" at any question to skip to the next one.
     requests = sys.argv[1:] or [
+        # Desktop: open and switch never ask; close asks first (unsaved work)
+        "Open the calculator",
+        "What apps are open right now",
+        "Switch to chrome",
+        "Close the calculator",
+        "Open my downloads folder",
         # Files: read only, never asks. Found / closest names / not found after scanning every drive (~25s)
         "Where did I put my resume pdf",
         "Do I have the acme invoice from march",

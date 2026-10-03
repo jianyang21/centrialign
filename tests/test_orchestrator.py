@@ -23,6 +23,7 @@ def fake_llm(*steps):
     o.ChatGroq = Fake
 
 o.browser_workflow.run = lambda task: {"output": f"fake result of '{task}'", "failed": "fail" in task}
+o.desktop_workflow.run = lambda task: {"output": f"fake result of '{task}'", "failed": False}
 
 # Files workflow runs for real, except its LLM (search vs other, by the first word) and the disk search
 class FakeFilesLLM:
