@@ -17,16 +17,22 @@ PAGE = """<label>To <input></label> <label>Password <input type=password></label
 <button onclick="document.title='saved'">Save draft</button>"""
 
 seen = []  # what the fake LLM was shown, per call
+verdicts = []  # what the fake verifier says, in order; empty = achieved
 
-def script(*actions):
+def script(*actions, verdict=()):
     """Fake LLM: returns these actions in order, then repeats the last one forever."""
     seen.clear()
+    verdicts[:] = verdict
     it, last = iter(actions), {}
     class Fake:
         def __init__(self, **kw): pass
-        def with_structured_output(self, schema, method): return self
+        def with_structured_output(self, schema, method):
+            self.schema = schema
+            return self
         def invoke(self, messages):
             nonlocal last
+            if self.schema is bw.Verdict:
+                return bw.Verdict(**(verdicts.pop(0) if verdicts else {"achieved": True, "reason": "page shows it"}))
             seen.append(messages[-1].content)
             last = next(it, last)
             try:
@@ -48,6 +54,7 @@ def run(task, *answers):
     return r
 
 def test_all():
+    bw.EVIDENCE_DIR = Path(tempfile.mkdtemp())  # screenshots go here, not into ~/.centrialign
     bw._pw = sync_playwright().start()
     bw._ctx = bw._pw.chromium.launch().new_context()  # headless, no profile
     page = bw.current_page
@@ -213,6 +220,21 @@ def test_all():
     # a looping LLM is stopped
     script({"tool": "press", "text": "Tab"})
     assert run("loop")["output"] == f"gave up after {bw.MAX_ACTIONS} actions"
+
+    # verification: a "done" the page doesn't prove goes back to the agent once, with the reason
+    no = {"achieved": False, "reason": "nothing in the Sent folder"}
+    script(done, done, verdict=[no])
+    r = run("send it")
+    assert "not verified: nothing in the Sent folder" in seen[1] and r["output"] == "finished" and not r["failed"], r
+    assert r["verified"] == "page shows it"
+    # rejected twice: the step fails as unverified, so the plan stops
+    script(done, verdict=[no, no])
+    r = run("send it")
+    assert r["failed"] and r["output"].startswith("not verified: nothing in the Sent folder"), r
+    # evidence: a screenshot of where it ended, done or failed
+    assert Path(r["screenshot"]).is_file() and Path(r["screenshot"]).parent == bw.EVIDENCE_DIR
+    script({"tool": "fail", "text": "site is down"})
+    assert Path(run("open it")["screenshot"]).is_file()
 
 if __name__ == "__main__":
     test_all()

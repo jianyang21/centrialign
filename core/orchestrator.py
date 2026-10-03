@@ -112,6 +112,10 @@ def run_workflow(name):
         task = s["steps"][s["current"]]["task"]
         r = REAL[name].run(with_context(task, s["results"]))
         out = {"workflow": name, "task": task, "output": r["output"]}
+        # evidence, saved with the task: the verifier's verdict, the final screenshot, every action and its result
+        out.update({k: r[k] for k in ("verified", "screenshot") if r.get(k)})
+        if r.get("history"):
+            out["actions"] = r["history"]
         failed = r.get("failed")  # stop the plan: later steps may depend on this one
         return {"results": s["results"] + [out], "current": len(s["steps"]) if failed else s["current"] + 1}
     return node
@@ -159,7 +163,9 @@ def drive(thread_id, first, ask=terminal_ask):
         return f"Paused by a network error ({type(e).__name__}). Finished steps are saved: resume it from " \
                f"the app's task list, or run `python orchestrator.py --resume`."
     db.task_update(thread_id, "done", results=result["results"])
-    return "\n".join(f"  {r['workflow']}: {r['task']} -> {r['output']}" for r in result["results"])
+    return "\n".join(f"  {r['workflow']}: {r['task']} -> {r['output']}"
+                     + (f"\n    verified: {r['verified']}" if r.get("verified") else "")
+                     + (f"\n    evidence: {r['screenshot']}" if r.get("screenshot") else "") for r in result["results"])
 
 def resume(t, ask=terminal_ask):
     """Continue one unfinished task (a row from db.unfinished()) where it stopped."""

@@ -5,6 +5,7 @@ Playwright's sync API and the Chrome connection belong to the thread that opened
 Search, window focus) is set up per thread. So one worker thread, created once and shared by every rerun
 and tab, runs every task one at a time; the page only shows its state and hands it input."""
 import queue
+import re
 import sys
 import threading
 import time
@@ -20,7 +21,7 @@ WORKING = "Working… the agent may use your windows and Chrome"
 
 class Agent:
     def __init__(self, failed=None):  # failed: an agent that couldn't start; its chat and queued requests carry over
-        self.chat = failed.chat if failed else []  # (role, text): "user", "assistant", or "log" (progress lines)
+        self.chat = failed.chat if failed else []  # (role, text): "user", "assistant", "log" (progress lines) or "image" (a path)
         self.question = None    # what a paused task is asking, while it waits for an answer
         self.status = "Starting…"
         self.tasks = []         # unfinished tasks from the database, for the sidebar
@@ -84,6 +85,7 @@ class Agent:
                 reply = f"Error: {type(e).__name__}: {str(e)[:300]}"
             self.question = None
             self.chat.append(("assistant", reply))
+            self.chat += [("image", path) for path in re.findall(r"evidence: (.+\.png)", reply)]
 
 
 class Progress:
@@ -131,6 +133,11 @@ def conversation():
     for role, text in agent.chat:
         if role == "log":
             st.text(text)
+        elif role == "image":  # evidence screenshot; it may have been deleted since
+            if Path(text).exists():
+                st.image(text)
+            else:
+                st.caption(f"(screenshot gone: {text})")
         else:
             st.chat_message(role).markdown(text.replace("\n", "  \n"))
     if agent.question:
