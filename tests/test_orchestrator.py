@@ -27,9 +27,11 @@ o.browser_workflow.run = lambda task: browser_tasks.append(task) or \
     {"output": f"fake result of '{task.splitlines()[0]}'", "failed": "fail" in task}
 o.desktop_workflow.run = lambda task: {"output": f"fake result of '{task}'", "failed": False}
 
+internal_prompts = []  # the system prompt the Internal workflow's model got
 class FakeChatLLM:  # the Internal workflow's model: answers with what it was asked
     def __init__(self, **kw): pass
     def invoke(self, messages):
+        internal_prompts.append(messages[0].content)
         return type("Reply", (), {"content": f"  answer to: {messages[-1].content}  "})()
 o.internal_workflow.ChatGroq = FakeChatLLM
 
@@ -120,7 +122,13 @@ def test_all():
     found = plan(("Files_Workflow", "find my resume pdf"))[0]
     assert found.startswith("Found 1 matching test:") and __file__ in found, found
     # Internal answers with its model, trimmed; with an earlier step it sees that step's result too
-    assert plan(("Internal_Workflow", "hi")) == ["answer to: hi"]
+    assert plan(("Internal_Workflow", "who is my boss")) == ["answer to: who is my boss"]
+    # the company context file goes into its prompt; without the file it says there is none
+    assert o.internal_workflow.CONTEXT_FILE.read_text(encoding="utf-8").strip() in internal_prompts[-1]
+    real_file, o.internal_workflow.CONTEXT_FILE = o.internal_workflow.CONTEXT_FILE, Path("no_such_context.md")
+    plan(("Internal_Workflow", "hi"))
+    assert "Company context:\n(none available)" in internal_prompts[-1]
+    o.internal_workflow.CONTEXT_FILE = real_file
     out = plan(("Files_Workflow", "find my resume pdf"), ("Internal_Workflow", "summarise what was found"))[1]
     assert out.startswith("answer to: summarise what was found\n\nResults of earlier steps") and __file__ in out, out
     # a later step gets what earlier steps produced: the file the Files step found reaches the Browser step
