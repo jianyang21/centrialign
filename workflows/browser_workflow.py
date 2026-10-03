@@ -15,6 +15,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt
 from playwright.sync_api import sync_playwright, Error as PlaywrightError
 from guards import check_paths, guard, resolve
+import db
 
 MODEL = os.getenv("BROWSER_MODEL", "openai/gpt-oss-120b")
 PROFILE_DIR = Path.home() / ".centrialign" / "browser-profile"  # logins survive restarts
@@ -132,6 +133,8 @@ def decide(s):
             f"Task: {s['task']}\n\nDone so far:\n{done_so_far}\n\nURL: {page.url}\nPage:\n{tree}")]).model_dump()
     except OutputParserException as e:  # malformed reply: show the LLM its mistake, let it retry
         return {**log(s, f"invalid reply, fix it: {str(e)[:300]}"), "action": {"tool": "retry"}}
+    except db.TRANSIENT:
+        raise  # network or rate limit: the orchestrator pauses the task so it can be resumed
     except Exception as e:
         return {"action": {"tool": "fail"}, "output": f"model error: {type(e).__name__}: {str(e)[:200]}", "failed": True}
     return {"action": a, "output": a["text"] or a["name"] or "", "failed": a["tool"] == "fail"}

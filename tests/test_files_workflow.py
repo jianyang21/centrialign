@@ -1,5 +1,4 @@
 """Offline checks for files_workflow search. Run: python tests/test_files_workflow.py"""
-import importlib
 import os
 import sys
 import tempfile
@@ -7,6 +6,8 @@ import time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # core/, where workflows/ and guards.py live
 from workflows import files_workflow as fw
+
+REAL_INDEX, REAL_DRIVES = fw.search_index, fw.drives
 
 
 def touch(root, rel, age_days=0):
@@ -29,6 +30,13 @@ def listed(r):
 
 
 def test_all():
+    try:
+        check_search()
+    finally:  # put the real ones back: under pytest other test files share this module
+        fw.search_index, fw.drives = REAL_INDEX, REAL_DRIVES
+
+
+def check_search():
     with tempfile.TemporaryDirectory() as root:
         old = touch(root, "Documents/Shakthi_Resume_2023.pdf", age_days=400)
         new = touch(root, "Downloads/ShakthiResume.pdf", age_days=1)
@@ -93,10 +101,9 @@ def test_all():
 def test_index():
     """The real Windows index: a quote can't break the SQL, and results are exact matches only.
     Returns [] where there is no index, which the search treats as 'scan instead'."""
-    real = importlib.reload(fw)  # undo find()'s patches
-    assert isinstance(real.search_index([["o'brien'; DROP"]], [".pdf"]), list)
-    for p in real.search_index([["py"], ["test"]], [".py"]):
-        assert real.score(p, [["py"], ["test"]]) == 2, p
+    assert isinstance(REAL_INDEX([["o'brien'; DROP"]], [".pdf"]), list)
+    for p in REAL_INDEX([["py"], ["test"]], [".py"]):
+        assert fw.score(p, [["py"], ["test"]]) == 2, p
 
 
 if __name__ == "__main__":

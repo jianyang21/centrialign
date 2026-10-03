@@ -1,8 +1,12 @@
 """Offline checks for the 3 fixes. Run: python tests/test_orchestrator.py   (or: python -m pytest tests)"""
 import itertools
+import os
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # core/, where orchestrator.py and guards.py live
+os.environ["DATABASE_URL"] = ""  # in memory: tests never touch the real database (load_dotenv won't override this)
+import groq
+import httpx
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import InMemorySaver
@@ -23,9 +27,6 @@ def fake_llm(*steps):
     o.ChatGroq = Fake
 
 browser_tasks = []  # what the browser step was actually given, context included
-o.browser_workflow.run = lambda task: browser_tasks.append(task) or \
-    {"output": f"fake result of '{task.splitlines()[0]}'", "failed": "fail" in task}
-o.desktop_workflow.run = lambda task: {"output": f"fake result of '{task}'", "failed": False}
 
 internal_prompts = []  # the system prompt the Internal workflow's model got
 class FakeChatLLM:  # the Internal workflow's model: answers with what it was asked
@@ -33,17 +34,25 @@ class FakeChatLLM:  # the Internal workflow's model: answers with what it was as
     def invoke(self, messages):
         internal_prompts.append(messages[0].content)
         return type("Reply", (), {"content": f"  answer to: {messages[-1].content}  "})()
-o.internal_workflow.ChatGroq = FakeChatLLM
 
-# Files workflow runs for real, except its LLM (search vs other, by the first word) and the disk search
 class FakeFilesLLM:
     def __init__(self, **kw): pass
     def with_structured_output(self, schema, method): return self
     def invoke(self, messages):
         words = messages[-1].content.split()
         return o.files_workflow.Search(action="search" if words[0] in ("find", "where") else "other", terms=[["test"]])
-o.files_workflow.ChatGroq = FakeFilesLLM
-o.files_workflow.search_index = lambda groups, ext: [__file__]  # one real file named test_..., so ranking can stat it
+
+def install_fakes():
+    """Run when the test starts, not at import: under pytest the other test files share these modules."""
+    o.db.URL = ""  # in memory, even if test_db imported orchestrator first with the real database
+    o.app = o.graph.compile(checkpointer=InMemorySaver())
+    o.browser_workflow.run = lambda task: browser_tasks.append(task) or \
+        {"output": f"fake result of '{task.splitlines()[0]}'", "failed": "fail" in task}
+    o.desktop_workflow.run = lambda task: {"output": f"fake result of '{task}'", "failed": False}
+    o.internal_workflow.ChatGroq = FakeChatLLM
+    # Files runs for real, except its LLM (search vs other, by the first word) and the disk search
+    o.files_workflow.ChatGroq = FakeFilesLLM
+    o.files_workflow.search_index = lambda groups, ext: [__file__]  # one real file named test_..., so ranking can stat it
 
 _ids = itertools.count()
 
@@ -89,6 +98,7 @@ def delete(path, *answers):
     return question(r) if "__interrupt__" in r else r["output"]
 
 def test_all():
+    install_fakes()
     docs = ALLOWED_ROOTS[0]
 
     # (a) empty / whitespace / oversized input never reaches the LLM
@@ -123,12 +133,12 @@ def test_all():
     assert found.startswith("Found 1 matching test:") and __file__ in found, found
     # Internal answers with its model, trimmed; with an earlier step it sees that step's result too
     assert plan(("Internal_Workflow", "who is my boss")) == ["answer to: who is my boss"]
-    # the company context file goes into its prompt; without the file it says there is none
-    assert o.internal_workflow.CONTEXT_FILE.read_text(encoding="utf-8").strip() in internal_prompts[-1]
-    real_file, o.internal_workflow.CONTEXT_FILE = o.internal_workflow.CONTEXT_FILE, Path("no_such_context.md")
-    plan(("Internal_Workflow", "hi"))
+    # without a database there is no company context, and its prompt says so
     assert "Company context:\n(none available)" in internal_prompts[-1]
-    o.internal_workflow.CONTEXT_FILE = real_file
+    # the company tables (as db renders them) go into its prompt
+    o.db.company_context = lambda: "The user: Arjun Mehta. People: Meera Nair | Engineering Manager"
+    plan(("Internal_Workflow", "who is my boss"))
+    assert "Company context:\nThe user: Arjun Mehta. People: Meera Nair" in internal_prompts[-1]
     out = plan(("Files_Workflow", "find my resume pdf"), ("Internal_Workflow", "summarise what was found"))[1]
     assert out.startswith("answer to: summarise what was found\n\nResults of earlier steps") and __file__ in out, out
     # a later step gets what earlier steps produced: the file the Files step found reaches the Browser step
@@ -140,6 +150,26 @@ def test_all():
     assert browser_tasks[-1] == "open gmail"
     # a failed browser step stops the rest of the plan
     assert plan(("Browser_Workflow", "fail to log in"), ("Files_Workflow", "find x")) == ["fake result of 'fail to log in'"]
+
+    # a network error pauses the task instead of failing it; resuming continues from the last finished step:
+    # the classifier and the Files step aren't run again, only the step that was cut off
+    real_run, real_index, browser_calls, index_calls = o.browser_workflow.run, o.files_workflow.search_index, [], []
+    def flaky_browser(task):
+        browser_calls.append(task)
+        if len(browser_calls) == 1:
+            raise groq.APIConnectionError(request=httpx.Request("POST", "https://api.groq.com"))
+        return {"output": "sent", "failed": False}
+    o.browser_workflow.run = flaky_browser
+    o.files_workflow.search_index = lambda groups, ext: index_calls.append(1) or [__file__]
+    fake_llm(("Files_Workflow", "find my resume pdf"), ("Browser_Workflow", "email it to John"))
+    classified = len(llm_calls)
+    out = o.drive("resume-test", {"user_request": "find my resume and email it to John"})
+    assert out.startswith("Stopped by a network error (APIConnectionError)"), out  # no DATABASE_URL in tests
+    out = o.drive("resume-test", None)  # what `--resume` does
+    assert "Browser_Workflow: email it to John -> sent" in out and "Files_Workflow: find my resume pdf" in out, out
+    assert len(llm_calls) == classified + 1 and len(index_calls) == 1 and len(browser_calls) == 2
+    assert __file__ in browser_calls[-1]  # the resumed step still gets the earlier step's result
+    o.browser_workflow.run, o.files_workflow.search_index = real_run, real_index
 
     # destructive tool: path outside the folders is refused with no question, nothing deleted
     assert delete("C:/Windows") == "refused: outside allowed folders: C:/Windows"

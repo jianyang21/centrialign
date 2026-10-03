@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
+import db
 
 MODEL = os.getenv("FILES_MODEL", "openai/gpt-oss-20b")
 MAX_RESULTS = 10
@@ -44,6 +45,8 @@ def run(task):
     llm = ChatGroq(model=MODEL, temperature=0).with_structured_output(Search, method="json_mode")
     try:
         found = llm.invoke([SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=task)])
+    except db.TRANSIENT:
+        raise  # network or rate limit: the orchestrator pauses the task so it can be resumed
     except Exception as e:
         return {"output": f"model error: {type(e).__name__}: {str(e)[:200]}", "failed": True}
     if found.action != "search":

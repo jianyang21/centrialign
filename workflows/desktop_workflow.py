@@ -17,6 +17,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt
 from guards import guard
+import db
 
 MODEL = os.getenv("DESKTOP_MODEL", "openai/gpt-oss-20b")
 MAX_CHOICES = 10
@@ -57,6 +58,8 @@ def understand(s):
     llm = ChatGroq(model=MODEL, temperature=0).with_structured_output(Action, method="json_mode")
     try:
         a = llm.invoke([SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=s["task"])])
+    except db.TRANSIENT:
+        raise  # network or rate limit: the orchestrator pauses the task so it can be resumed
     except Exception as e:
         return {"output": f"model error: {type(e).__name__}: {str(e)[:200]}", "failed": True}
     target = a.target.strip()

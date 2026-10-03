@@ -5,9 +5,9 @@ from typing_extensions import TypedDict
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import interrupt, Command
-from langgraph.checkpoint.memory import InMemorySaver
 from dotenv import load_dotenv
-load_dotenv()  # before the workflow imports: they read their settings (BROWSER_MODEL, CHROME_PATH) at import
+load_dotenv()  # before db and the workflows: they read their settings (DATABASE_URL, BROWSER_MODEL...) at import
+import db
 from workflows import browser_workflow, desktop_workflow, files_workflow, internal_workflow
 
 
@@ -87,6 +87,8 @@ def user_intent(state:OrchestratorState):
     try:
         classification = structured_llm.invoke([SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=request)])
         steps = classification.steps
+    except db.TRANSIENT:
+        raise  # network or rate limit: the orchestrator pauses the task so it can be resumed
     except Exception as e:
         print(f"classifier error: {type(e).__name__}: {str(e)[:300]}")
         return unclassified(f"could not classify '{request[:100]}'")
@@ -126,13 +128,51 @@ graph.add_conditional_edges('user_intent',next_step,["clarify",END] + WORKFLOWS)
 graph.add_edge("clarify",'user_intent')
 
 
-app = graph.compile(checkpointer=InMemorySaver())
+# Postgres when DATABASE_URL is set: every finished step is saved, so a paused task resumes where it stopped
+app = graph.compile(checkpointer=db.checkpointer())
+
+CANCEL = (["cancel"], ["exit"], ["quit"], ["abort"])
+
+def drive(thread_id, first):
+    """Run a task (first = its input) or resume it (first = None) until it finishes, is cancelled,
+    or pauses on a network error. Its row in the tasks table follows along."""
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        result = app.invoke(first, config)
+        while "__interrupt__" in result:
+            question = result["__interrupt__"][0].value
+            db.task_update(thread_id, "waiting", question=question)  # Ctrl+C here leaves it resumable
+            answer = input(f"{question}\nYou: ")
+            if answer.strip(" .!").lower().split()[:1] in CANCEL:
+                db.task_update(thread_id, "cancelled")  # never resumed, so nothing after this question runs
+                return "Cancelled."
+            db.task_update(thread_id, "running")
+            result = app.invoke(Command(resume=answer), config)
+    except db.TRANSIENT as e:
+        db.task_update(thread_id, "interrupted", error=f"{type(e).__name__}: {str(e)[:300]}")
+        if not db.URL:
+            return f"Stopped by a network error ({type(e).__name__}). Without DATABASE_URL progress isn't saved."
+        return f"Paused by a network error ({type(e).__name__}). Finished steps are saved: run " \
+               f"`python orchestrator.py --resume` to continue from here."
+    db.task_update(thread_id, "done", results=result["results"])
+    return "\n".join(f"  {r['workflow']}: {r['task']} -> {r['output']}" for r in result["results"])
+
+def resume_all():
+    tasks = db.unfinished()
+    if not tasks:
+        print("Nothing to resume." if db.URL else "Nothing to resume: set DATABASE_URL so tasks are saved.")
+    for t in tasks:
+        print(f"\nResuming: {t['request']}" + (f"  (was: {t['error']})" if t["error"] else ""))
+        saved = app.get_state({"configurable": {"thread_id": t["thread_id"]}})
+        # nothing saved yet (it stopped before the first step finished): start it again from the request
+        print(drive(t["thread_id"], None if saved.values else {"user_request": t["request"]}))
 
 if __name__ == '__main__':
     import sys
+    import uuid
     # Scenarios, safest first. Type "cancel" at any question to skip to the next one.
     requests = sys.argv[1:] or [
-        # Internal: company questions answered from company_context.md (simulated), and general ones
+        # Internal: company questions answered from the company tables in Postgres (simulated data), and general ones
         "Who's my boss?",
         "Who handles reimbursements?",
         "What is GDP in one sentence?",
@@ -164,22 +204,11 @@ if __name__ == '__main__':
         # reply: finds the email, reads it, drafts a reply, asks before Send
         "Search for the latest email from sddeva@gmail.com and draft a reply",
     ]
-    for i, request in enumerate(requests):
-        config = {"configurable": {"thread_id": str(i)}}
-        result = app.invoke({"user_request": request}, config)
-
-        cancelled = False
-        while "__interrupt__" in result:
-            question = result["__interrupt__"][0].value
-            answer = input(f"{question}\nYou: ")
-            if answer.strip(" .!").lower().split()[:1] in (["cancel"], ["exit"], ["quit"], ["abort"]):
-                cancelled = True  # never resumed, so nothing after this question runs
-                break
-            result = app.invoke(Command(resume=answer), config)
-
-        if cancelled:
-            print(f"\nCancelled: {request}")
-            continue
+    if sys.argv[1:] == ["--resume"]:  # continue tasks paused by a network error, a crash or Ctrl+C
+        resume_all()
+        sys.exit()
+    for request in requests:
+        thread_id = str(uuid.uuid4())  # unique per task: saved checkpoints must never mix two tasks
+        db.task_started(thread_id, request)
         print(f"\n{request}")
-        for r in result["results"]:
-            print(f"  {r['workflow']}: {r['task']} -> {r['output']}")
+        print(drive(thread_id, {"user_request": request}))
