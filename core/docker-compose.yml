@@ -1,0 +1,25 @@
+# Postgres for company data, task records and LangGraph checkpoints.
+#   docker compose up -d        start (first start loads schema.sql)
+#   docker compose down         stop; the data stays in the pgdata volume
+#   docker compose down -v      stop AND wipe the data (schema.sql loads again on next start)
+services:
+  db:
+    image: postgres:16
+    container_name: centrialign-db
+    environment:
+      POSTGRES_DB: centrialign
+      POSTGRES_USER: centrialign
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-centrialign}  # local dev default; set POSTGRES_PASSWORD to change it
+    ports:
+      - "127.0.0.1:5432:5432"  # this machine only, never the network
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U centrialign -d centrialign"]
+      interval: 2s
+      retries: 30
+    restart: unless-stopped
+
+volumes:
+  pgdata:
