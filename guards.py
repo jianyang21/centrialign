@@ -1,6 +1,5 @@
 """Shared guardrails. Every workflow calls guard() right before a destructive side effect."""
 import os
-import re
 from pathlib import Path
 from langgraph.types import interrupt
 
@@ -46,22 +45,3 @@ def guard(action: str, *paths) -> str | None:
     if answer.lower() in ("y", "yes"):
         return None
     return "declined by user" + (f": {answer}" if answer.lower() not in ("", "n", "no") else "")
-
-
-# ponytail: placeholder-only; real workflows pass guard() the exact path their tool will touch.
-# Delete with the placeholders. Where a path-like token starts: C:/x, C:x, ~, \\unc, .., /x, %VAR%, $env:X, $HOME
-PATH_START = re.compile(r"""(?<![^\s"'(])(?:[A-Za-z]:(?=\S)|~|\\\\|\.\.|/|%\w+%|\$env:\w+|\$[A-Za-z_]\w*)""")
-
-
-def path_readings(task: str) -> list[str]:
-    """Free text can't say where a path with spaces ends, so return every reading of each path:
-    cut at each following space, and run to the end. guard() then has to accept all of them."""
-    out = []
-    for m in PATH_START.finditer(task):
-        rest = task[m.start():]
-        ends = [i for i, c in enumerate(rest) if c.isspace()] + [len(rest)]
-        for i in ends:
-            r = rest[:i].rstrip("\"').,;")
-            if r and r not in out:
-                out.append(r)
-    return out

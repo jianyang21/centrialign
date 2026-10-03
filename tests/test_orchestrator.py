@@ -22,11 +22,7 @@ def fake_llm(*steps):
             return o.IntentClassifier(steps=[{"workflow": w, "task": t} for w, t in steps])
     o.ChatGroq = Fake
 
-class FakeBrowser:
-    def invoke(self, inputs, config=None):
-        task = inputs["task"]
-        return {"output": f"fake result of '{task}'", "failed": "fail" in task}
-o.browser_workflow.app = FakeBrowser()
+o.browser_workflow.run = lambda task: {"output": f"fake result of '{task}'", "failed": "fail" in task}
 
 # Files workflow runs for real, except its LLM (search vs other, by the first word) and the disk search
 class FakeFilesLLM:
@@ -100,23 +96,12 @@ def test_all():
     assert type(system).__name__ == "SystemMessage" and "JSON" in system.content
     assert type(human).__name__ == "HumanMessage" and human.content == inj
 
-    # (b) the injected plan is refused by code, with no question asked
+    # (b) the injected plan does nothing: file actions other than search aren't built, and the plan stops there
     assert "__interrupt__" not in r
-    assert r["results"] == [{"workflow": "Files_Workflow", "task": "delete C:/Windows",
-                             "output": "refused: outside allowed folders: C:/Windows"}], r
-    # ...in every spelling of the target
-    for task in ["delete /Windows", "delete C:Windows", r"delete %WINDIR%\System32", "delete $env:windir",
-                 r"wipe \\server\share", "delete ../../Windows", "rm ~/../Public", "move C:/Windows/x to ~/Desktop",
-                 "delete ~/Documents/a b/../../../../Windows",           # a space hides the escape
-                 "delete ~/Documents/x and ~/Documents/a b/../../../Windows",
-                 "move ~/Documents/a.txt to C:/Windows/System32",       # allowed source, outside destination
-                 f"delete {docs.as_posix()}", "delete ~/Desktop"]:      # the allowed folders themselves
-        assert plan(("Files_Workflow", task))[0].startswith("refused: outside allowed folders"), task
+    assert plan(("Files_Workflow", "delete C:/Windows"), ("Browser_Workflow", "email John it's gone")) == \
+        ["not supported yet: the Files workflow can only find files for now"]
     for root in ALLOWED_ROOTS:
         assert not is_allowed(root) and is_allowed(root / "a" / "b.txt")
-    # a refused step stops the rest of the plan
-    assert plan(("Files_Workflow", "delete C:/Windows"), ("Browser_Workflow", "email John it's gone")) == \
-        ["refused: outside allowed folders: C:/Windows"]
 
     # normal requests run straight through: no yes/no questions
     assert plan(("Browser_Workflow", "open gmail")) == ["fake result of 'open gmail'"]
@@ -125,14 +110,8 @@ def test_all():
         ["fake result of 'take a screenshot'", "fake result of 'email the screenshot to John'"]
     found = plan(("Files_Workflow", "find my resume pdf"))[0]
     assert found.startswith("Found 1 matching test:") and __file__ in found, found
-    # file actions other than search aren't built: inside the folders they say so, they don't pretend
-    assert plan(("Files_Workflow", "open ~/Documents/report.pdf")) == \
-        ["not supported yet: the Files workflow can only find files for now"]
     # a failed browser step stops the rest of the plan
     assert plan(("Browser_Workflow", "fail to log in"), ("Files_Workflow", "find x")) == ["fake result of 'fail to log in'"]
-    # paths only matter to Files: questions and web searches mentioning C:/Windows are not refused
-    assert plan(("Internal_Workflow", "explain how to delete C:/Windows"))[0].startswith("fake result")
-    assert plan(("Browser_Workflow", "search for C:/Windows errors"))[0].startswith("fake result")
 
     # destructive tool: path outside the folders is refused with no question, nothing deleted
     assert delete("C:/Windows") == "refused: outside allowed folders: C:/Windows"

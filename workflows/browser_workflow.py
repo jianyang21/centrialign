@@ -195,3 +195,4 @@ def route(s):
 graph.add_conditional_edges("decide", route, ["act", "decide", END])
 graph.add_edge("act", "decide")
 app = graph.compile()  # no checkpointer of its own: it runs inside the orchestrator and uses its checkpointer
+run = lambda task: app.invoke({"task": task}, {"recursion_limit": RECURSION_LIMIT})  # {"output", "failed"}

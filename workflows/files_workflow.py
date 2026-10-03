@@ -5,14 +5,10 @@ import string
 from datetime import datetime
 from typing import Literal
 from pydantic import BaseModel, Field
-from typing_extensions import TypedDict
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.graph import StateGraph, START, END
-from guards import check_paths, path_readings
 
 MODEL = os.getenv("FILES_MODEL", "openai/gpt-oss-20b")
-RECURSION_LIMIT = 10
 MAX_RESULTS = 10
 # Folders nobody means by "my file": system, app data, dependencies, caches. Hidden (.x, $x) folders too.
 SKIP_DIRS = {"windows", "program files", "program files (x86)", "programdata", "appdata", "$recycle.bin",
@@ -41,27 +37,18 @@ class Search(BaseModel):
     extensions: list[str] = Field(default_factory=list)
 
 
-class FilesState(TypedDict):
-    task: str
-    search: dict
-    output: str
-    failed: bool
-
-
-def understand(s):
+# ponytail: a plain function, no graph: nothing here pauses. Becomes a graph when a Files tool calls guard(),
+# since interrupt() only works inside a graph node.
+def run(task):
+    """Returns {"output", "failed"}, like every workflow."""
     llm = ChatGroq(model=MODEL, temperature=0).with_structured_output(Search, method="json_mode")
     try:
-        found = llm.invoke([SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=s["task"])])
+        found = llm.invoke([SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=task)])
     except Exception as e:
         return {"output": f"model error: {type(e).__name__}: {str(e)[:200]}", "failed": True}
-    return {"search": found.model_dump()}
-
-
-def other(s):
-    # nothing here touches the disk yet; the path check keeps the refusal visible until real tools exist
-    if (blocked := check_paths(*path_readings(s["task"]))):
-        return {"output": blocked, "failed": True}
-    return {"output": "not supported yet: the Files workflow can only find files for now", "failed": True}
+    if found.action != "search":
+        return {"output": "not supported yet: the Files workflow can only find files for now", "failed": True}
+    return search({"search": found.model_dump()})
 
 
 def search(s):
@@ -149,15 +136,3 @@ def rank(paths, groups):
         except OSError:
             pass
     return sorted(found, key=lambda h: (-h[2], -h[1]))
-
-
-graph = StateGraph(FilesState)
-graph.add_node("understand", understand)
-graph.add_node("search", search)
-graph.add_node("other", other)
-graph.add_edge(START, "understand")
-graph.add_conditional_edges("understand", lambda s: END if s.get("failed") else s["search"]["action"],
-                            ["search", "other", END])
-graph.add_edge("search", END)
-graph.add_edge("other", END)
-app = graph.compile()

@@ -96,13 +96,13 @@ def make_workflow(name):
         return {"results":s["results"] + [out],"current":s["current"] + 1}
     return workflow
 
-# Built workflows: each takes {"task"} and returns {"output", "failed"}.
+# Built workflows: each has run(task) -> {"output", "failed"}.
 REAL = {"Browser_Workflow": browser_workflow, "Files_Workflow": files_workflow}
 
 def run_workflow(name):
     def node(s):
         task = s["steps"][s["current"]]["task"]
-        r = REAL[name].app.invoke({"task": task}, {"recursion_limit": REAL[name].RECURSION_LIMIT})
+        r = REAL[name].run(task)
         out = {"workflow": name, "task": task, "output": r["output"]}
         failed = r.get("failed")  # stop the plan: later steps may depend on this one
         return {"results": s["results"] + [out], "current": len(s["steps"]) if failed else s["current"] + 1}
