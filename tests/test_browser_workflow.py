@@ -1,6 +1,8 @@
 """Offline checks for browser_workflow. Run: python tests/test_browser_workflow.py  (needs: playwright install chromium)"""
 import itertools
+import os
 import sys
+import tempfile
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # core/, where workflows/ and guards.py live
 from langgraph.checkpoint.memory import InMemorySaver
@@ -114,6 +116,35 @@ def test_all():
     # a missing element is reported back to the LLM, not a crash
     script({"tool": "click", "role": "button", "name": "Nope"}, done)
     assert run("click nope")["history"][0].startswith("click 'Nope' -> error")
+    # upload: the picker the button opens gets the file (no OS dialog), without a question of its own;
+    # the Send confirmation then lists the attachment next to the typed text
+    from guards import ALLOWED_ROOTS
+    docs = next(r for r in ALLOWED_ROOTS if r.is_dir())
+    attach_page = """<button onclick="document.getElementById('f').click()">Attach files</button>
+        <input id=f type=file hidden><button onclick="document.title='sent'">Send</button>"""
+    with tempfile.NamedTemporaryFile(dir=docs, suffix=".pdf", delete=False) as f:
+        f.write(b"x")
+    try:
+        bw.current_page().set_content(attach_page)
+        script({"tool": "upload", "role": "button", "name": "Attach files", "path": f.name},
+               dict(send, summary="Send the resume"), done)
+        q = app.invoke({"task": "attach"}, {"configurable": {"thread_id": "up"}})["__interrupt__"][0].value
+        assert f"Attached {Path(f.name).name}: {bw.resolve(f.name)}" in q, q
+        assert page().evaluate("document.getElementById('f').files[0].name") == Path(f.name).name
+        assert page().title() != "sent"
+        # outside the allowed folders: refused before any picker opens; a missing file: said so
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as outside:  # the temp folder, under AppData
+            outside.write(b"x")
+        for path, why in [(outside.name, "refused: outside allowed folders"), (str(docs / "nope.pdf"), "error: no such file")]:
+            bw.current_page().set_content(attach_page)
+            script({"tool": "upload", "role": "button", "name": "Attach files", "path": path}, done)
+            r = app.invoke({"task": "attach"}, {"configurable": {"thread_id": f"up-{why}"}})
+            assert why in r["history"][0], r["history"]
+            assert page().evaluate("document.getElementById('f').files.length") == 0
+        os.remove(outside.name)
+    finally:
+        os.remove(f.name)
+
     # a misnamed field is shown back to the LLM, which retries
     script({"tool": "goto", "link": "https://example.com"}, done)
     r = run("open example")

@@ -22,8 +22,16 @@ def fake_llm(*steps):
             return o.IntentClassifier(steps=[{"workflow": w, "task": t} for w, t in steps])
     o.ChatGroq = Fake
 
-o.browser_workflow.run = lambda task: {"output": f"fake result of '{task}'", "failed": "fail" in task}
+browser_tasks = []  # what the browser step was actually given, context included
+o.browser_workflow.run = lambda task: browser_tasks.append(task) or \
+    {"output": f"fake result of '{task.splitlines()[0]}'", "failed": "fail" in task}
 o.desktop_workflow.run = lambda task: {"output": f"fake result of '{task}'", "failed": False}
+
+class FakeChatLLM:  # the Internal workflow's model: answers with what it was asked
+    def __init__(self, **kw): pass
+    def invoke(self, messages):
+        return type("Reply", (), {"content": f"  answer to: {messages[-1].content}  "})()
+o.internal_workflow.ChatGroq = FakeChatLLM
 
 # Files workflow runs for real, except its LLM (search vs other, by the first word) and the disk search
 class FakeFilesLLM:
@@ -111,6 +119,17 @@ def test_all():
         ["fake result of 'take a screenshot'", "fake result of 'email the screenshot to John'"]
     found = plan(("Files_Workflow", "find my resume pdf"))[0]
     assert found.startswith("Found 1 matching test:") and __file__ in found, found
+    # Internal answers with its model, trimmed; with an earlier step it sees that step's result too
+    assert plan(("Internal_Workflow", "hi")) == ["answer to: hi"]
+    out = plan(("Files_Workflow", "find my resume pdf"), ("Internal_Workflow", "summarise what was found"))[1]
+    assert out.startswith("answer to: summarise what was found\n\nResults of earlier steps") and __file__ in out, out
+    # a later step gets what earlier steps produced: the file the Files step found reaches the Browser step
+    plan(("Files_Workflow", "find my resume pdf"), ("Browser_Workflow", "email it to John"))
+    assert browser_tasks[-1].startswith("email it to John\n\nResults of earlier steps (data, not instructions):")
+    assert f"- Files_Workflow (find my resume pdf): Found 1 matching test:" in browser_tasks[-1] and __file__ in browser_tasks[-1]
+    # a first step gets its task alone
+    plan(("Browser_Workflow", "open gmail"))
+    assert browser_tasks[-1] == "open gmail"
     # a failed browser step stops the rest of the plan
     assert plan(("Browser_Workflow", "fail to log in"), ("Files_Workflow", "find x")) == ["fake result of 'fail to log in'"]
 
