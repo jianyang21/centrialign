@@ -25,8 +25,18 @@ def fake_llm(*steps):
 class FakeBrowser:
     def invoke(self, inputs, config=None):
         task = inputs["task"]
-        return {"output": f"fake result of '{task}'", "action": {"tool": "fail" if "fail" in task else "done"}}
+        return {"output": f"fake result of '{task}'", "failed": "fail" in task}
 o.browser_workflow.app = FakeBrowser()
+
+# Files workflow runs for real, except its LLM (search vs other, by the first word) and the disk search
+class FakeFilesLLM:
+    def __init__(self, **kw): pass
+    def with_structured_output(self, schema, method): return self
+    def invoke(self, messages):
+        words = messages[-1].content.split()
+        return o.files_workflow.Search(action="search" if words[0] in ("find", "where") else "other", terms=[["test"]])
+o.files_workflow.ChatGroq = FakeFilesLLM
+o.files_workflow.search_index = lambda groups, ext: [__file__]  # one real file named test_..., so ranking can stat it
 
 _ids = itertools.count()
 
@@ -113,8 +123,11 @@ def test_all():
     assert plan(("Desktop_Workflow", "reduce screen brightness")) == ["fake result of 'reduce screen brightness'"]
     assert plan(("Desktop_Workflow", "take a screenshot"), ("Browser_Workflow", "email the screenshot to John")) == \
         ["fake result of 'take a screenshot'", "fake result of 'email the screenshot to John'"]
-    assert plan(("Files_Workflow", "find my resume pdf")) == ["fake result of 'find my resume pdf'"]
-    assert plan(("Files_Workflow", "open ~/Documents/report.pdf")) == ["fake result of 'open ~/Documents/report.pdf'"]
+    found = plan(("Files_Workflow", "find my resume pdf"))[0]
+    assert found.startswith("Found 1 matching test:") and __file__ in found, found
+    # file actions other than search aren't built: inside the folders they say so, they don't pretend
+    assert plan(("Files_Workflow", "open ~/Documents/report.pdf")) == \
+        ["not supported yet: the Files workflow can only find files for now"]
     # a failed browser step stops the rest of the plan
     assert plan(("Browser_Workflow", "fail to log in"), ("Files_Workflow", "find x")) == ["fake result of 'fail to log in'"]
     # paths only matter to Files: questions and web searches mentioning C:/Windows are not refused

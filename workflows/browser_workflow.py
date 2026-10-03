@@ -72,6 +72,7 @@ class BrowserState(TypedDict):
     history: list[str]  # "action -> result" lines, shown back to the LLM
     action: dict
     output: str
+    failed: bool  # the orchestrator stops the plan when a workflow fails
     typed: dict  # field name -> text typed since the last confirmed action; shown when asking to confirm
 
 
@@ -118,7 +119,7 @@ def page_tree(page):
 def decide(s):
     history = s.get("history", [])
     if len(history) >= MAX_ACTIONS:
-        return {"action": {"tool": "fail"}, "output": f"gave up after {MAX_ACTIONS} actions"}
+        return {"action": {"tool": "fail"}, "output": f"gave up after {MAX_ACTIONS} actions", "failed": True}
     page = current_page()
     tree = page_tree(page)
     done_so_far = "\n".join(history) or "nothing yet"
@@ -129,8 +130,8 @@ def decide(s):
     except OutputParserException as e:  # malformed reply: show the LLM its mistake, let it retry
         return {**log(s, f"invalid reply, fix it: {str(e)[:300]}"), "action": {"tool": "retry"}}
     except Exception as e:
-        return {"action": {"tool": "fail"}, "output": f"model error: {type(e).__name__}: {str(e)[:200]}"}
-    return {"action": a, "output": a["text"] or a["name"] or ""}
+        return {"action": {"tool": "fail"}, "output": f"model error: {type(e).__name__}: {str(e)[:200]}", "failed": True}
+    return {"action": a, "output": a["text"] or a["name"] or "", "failed": a["tool"] == "fail"}
 
 
 def act(s):

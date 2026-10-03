@@ -8,8 +8,7 @@ from langgraph.types import interrupt, Command
 from langgraph.checkpoint.memory import InMemorySaver
 from dotenv import load_dotenv
 load_dotenv()  # before the workflow imports: they read their settings (BROWSER_MODEL, CHROME_PATH) at import
-from guards import check_paths, path_readings
-from workflows import browser_workflow
+from workflows import browser_workflow, files_workflow
 
 
 WorkFlowRoute = Literal["Browser_Workflow","Files_Workflow","Desktop_Workflow","Internal_Workflow","Unclassified"]
@@ -89,32 +88,31 @@ def user_intent(state:OrchestratorState):
 
 # ponytail: placeholder workflows return fake outputs to test routing; replace each with its real agent.
 # Real workflows call guard(action, exact_path) inside their destructive tools only (delete, move, send,
-# pay, change settings); safe tools (open, search, read, screenshot) just run. Placeholders do nothing
-# real, so they never ask: the Files placeholder only refuses paths outside the allowed folders.
+# pay, change settings); safe tools (open, search, read, screenshot) just run.
 def make_workflow(name):
     def workflow(s):
-        step = s["steps"][s["current"]]
-        task = step["task"]
-        blocked = check_paths(*path_readings(task)) if name == "Files_Workflow" else None
-        if blocked:  # stop the whole plan: later steps may depend on this one
-            out = {"workflow":name,"task":task,"output":blocked}
-            return {"results":s["results"] + [out],"current":len(s["steps"])}
+        task = s["steps"][s["current"]]["task"]
         out = {"workflow":name,"task":task,"output":f"fake result of '{task}'"}
         return {"results":s["results"] + [out],"current":s["current"] + 1}
     return workflow
 
-def browser(s):
-    task = s["steps"][s["current"]]["task"]
-    r = browser_workflow.app.invoke({"task": task}, {"recursion_limit": browser_workflow.RECURSION_LIMIT})
-    out = {"workflow": "Browser_Workflow", "task": task, "output": r["output"]}
-    failed = r["action"]["tool"] == "fail"  # stop the plan: later steps may depend on this one
-    return {"results": s["results"] + [out], "current": len(s["steps"]) if failed else s["current"] + 1}
+# Built workflows: each takes {"task"} and returns {"output", "failed"}.
+REAL = {"Browser_Workflow": browser_workflow, "Files_Workflow": files_workflow}
+
+def run_workflow(name):
+    def node(s):
+        task = s["steps"][s["current"]]["task"]
+        r = REAL[name].app.invoke({"task": task}, {"recursion_limit": REAL[name].RECURSION_LIMIT})
+        out = {"workflow": name, "task": task, "output": r["output"]}
+        failed = r.get("failed")  # stop the plan: later steps may depend on this one
+        return {"results": s["results"] + [out], "current": len(s["steps"]) if failed else s["current"] + 1}
+    return node
 
 graph = StateGraph(OrchestratorState)
 graph.add_node("user_intent",user_intent)
 graph.add_node('clarify',clarify)
 for wf in WORKFLOWS:
-    graph.add_node(wf, browser if wf == "Browser_Workflow" else make_workflow(wf))
+    graph.add_node(wf, run_workflow(wf) if wf in REAL else make_workflow(wf))
     graph.add_conditional_edges(wf,next_step,["clarify",END] + WORKFLOWS)
 
 graph.add_edge(START,"user_intent")
@@ -126,8 +124,14 @@ app = graph.compile(checkpointer=InMemorySaver())
 
 if __name__ == '__main__':
     import sys
-    # Browser scenarios, safest first. Type "cancel" at any question to skip to the next one.
+    # Scenarios, safest first. Type "cancel" at any question to skip to the next one.
     requests = sys.argv[1:] or [
+        # Files: read only, never asks. Found / closest names / not found after scanning every drive (~25s)
+        "Where did I put my resume pdf",
+        "Do I have the acme invoice from march",
+        "Find the photos from my goa trip",
+        # Files: not built yet, says so instead of pretending
+        "Delete old.txt from my Documents",
         # read only: navigate and answer, never asks
         "Go to wikipedia and tell me who is the highest goal scorer for the Germany national football team",
         # typing + clicking on a site, never asks
